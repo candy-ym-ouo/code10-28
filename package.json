@@ -1,0 +1,32 @@
+{
+  "name": "practice-review-notebook",
+  "version": "1.0.0",
+  "private": true,
+  "description": "乐器练习复盘本：Vue 3 + Fastify + PostgreSQL 的完整练习闭环应用",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  },
+  "scripts": {
+    "dev": "concurrently -n web,api,worker -c cyan,green,yellow \"npm run dev -w @practice/web\" \"npm run dev -w @practice/api\" \"npm run dev -w @practice/worker\"",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "test:e2e": "npm run test:e2e -w @practice/web",
+    "db:generate": "npm run prisma:generate -w @practice/api",
+    "db:migrate": "npm run prisma:migrate -w @practice/api",
+    "db:deploy": "npm run prisma:deploy -w @practice/api",
+    "db:studio": "npm run prisma:studio -w @practice/api",
+    "predev": "npm run build -w @practice/contracts",
+    "pretypecheck": "npm run build -w @practice/contracts",
+    "prebuild": "npm run build -w @practice/contracts"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  }
+}
