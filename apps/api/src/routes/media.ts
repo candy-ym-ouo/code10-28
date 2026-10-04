@@ -6,7 +6,7 @@ import { getConfig } from "../config/env.js";
 import { AppError, notFound } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import { enqueueProbe } from "../lib/queue.js";
-import { createPlaybackUrl, createUploadUrl, deleteObject, verifyObject } from "../lib/s3.js";
+import { createPlaybackUrl, createUploadUrl, deleteObject, objectExists, verifyObject } from "../lib/s3.js";
 import { parseOrThrow } from "../lib/validation.js";
 import { audit } from "../lib/audit.js";
 
@@ -74,41 +74,51 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
       orderBy: { processedAt: "desc" },
     });
     if (reusable) {
-      const media = await prisma.mediaAsset.create({
-        data: {
-          userId: request.authUser!.id,
-          sessionId,
-          status: "READY",
-          objectKey: reusable.objectKey,
-          originalName: input.originalName,
-          mimeType: input.mimeType,
-          sizeBytes: input.sizeBytes,
-          sha256: reusable.sha256,
-          durationMs: reusable.durationMs,
-          codec: reusable.codec,
-          sampleRate: reusable.sampleRate,
-          channels: reusable.channels,
-          peaks: reusable.peaks ?? undefined,
-          uploadedAt: new Date(),
-          processedAt: new Date(),
-        },
-        select: {
-          id: true,
-          status: true,
-          originalName: true,
-          mimeType: true,
-          sizeBytes: true,
-          durationMs: true,
-          codec: true,
-          sampleRate: true,
-          channels: true,
-          peaks: true,
-          failureCode: true,
-          failureMessage: true,
-          createdAt: true,
-        },
+      // 与删除接口共用同一把对象级锁，并在锁内复核来源记录，
+      // 避免复用到一个正好在被删除的对象
+      const media = await prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${reusable.objectKey}))`;
+        const source = await tx.mediaAsset.findFirst({ where: { id: reusable.id, status: "READY" } });
+        if (!source) return null;
+        return tx.mediaAsset.create({
+          data: {
+            userId: request.authUser!.id,
+            sessionId,
+            status: "READY",
+            objectKey: source.objectKey,
+            originalName: input.originalName,
+            mimeType: input.mimeType,
+            sizeBytes: input.sizeBytes,
+            sha256: source.sha256,
+            durationMs: source.durationMs,
+            codec: source.codec,
+            sampleRate: source.sampleRate,
+            channels: source.channels,
+            peaks: source.peaks ?? undefined,
+            uploadedAt: new Date(),
+            processedAt: new Date(),
+          },
+          select: {
+            id: true,
+            status: true,
+            originalName: true,
+            mimeType: true,
+            sizeBytes: true,
+            durationMs: true,
+            codec: true,
+            sampleRate: true,
+            channels: true,
+            peaks: true,
+            failureCode: true,
+            failureMessage: true,
+            createdAt: true,
+          },
+        });
       });
-      return reply.status(201).send({ media, reused: true, uploadUrl: null, requiredHeaders: {}, expiresAt: null });
+      if (media) {
+        return reply.status(201).send({ media, reused: true, uploadUrl: null, requiredHeaders: {}, expiresAt: null });
+      }
+      // 来源记录刚被删除，回退为全新上传
     }
 
     const mediaId = randomUUID();
@@ -209,6 +219,15 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
     const media = await prisma.mediaAsset.findFirst({ where: { id: mediaId, userId: request.authUser!.id } });
     if (!media) throw notFound();
     if (media.status !== "READY") throw new AppError(409, "MEDIA_NOT_READY", "音频尚未完成校验");
+    if (!(await objectExists(media.objectKey))) {
+      // 对象已消失：把引用该对象的记录置为 FAILED，使状态与文件保持一致，且不再签发播放地址
+      await prisma.mediaAsset.updateMany({
+        where: { objectKey: media.objectKey, status: "READY" },
+        data: { status: "FAILED", failureCode: "OBJECT_MISSING", failureMessage: "音频文件已不存在，请重新上传" },
+      });
+      await audit(request, "MEDIA_PLAYBACK_REJECTED", "MEDIA_ASSET", media.id, "FAILURE", { reason: "OBJECT_MISSING" });
+      throw new AppError(410, "MEDIA_OBJECT_MISSING", "音频文件已不存在，请重新上传");
+    }
     const url = await createPlaybackUrl(media.objectKey, media.originalName, media.mimeType);
     return { url, expiresIn: getConfig().PLAYBACK_URL_TTL_SECONDS };
   });
@@ -232,9 +251,23 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
     const { mediaId } = request.params as { mediaId: string };
     const media = await prisma.mediaAsset.findFirst({ where: { id: mediaId, userId: request.authUser!.id } });
     if (!media) throw notFound();
-    const referenceCount = await prisma.mediaAsset.count({ where: { objectKey: media.objectKey } });
-    if (referenceCount === 1) await deleteObject(media.objectKey);
-    await prisma.mediaAsset.delete({ where: { id: media.id } });
+    // 先删数据库记录、提交后再删对象：中途失败只会留下可回收的孤儿对象，
+    // 不会留下指向已消失对象的可用记录，恢复后状态与文件始终一致
+    const shouldDeleteObject = await prisma.$transaction(async (tx) => {
+      // 与上传复用路径共用同一把对象级锁，引用计数与删除必须原子完成
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${media.objectKey}))`;
+      const deleted = await tx.mediaAsset.deleteMany({ where: { id: media.id } });
+      if (deleted.count === 0) throw notFound();
+      const remaining = await tx.mediaAsset.count({ where: { objectKey: media.objectKey } });
+      return remaining === 0;
+    });
+    if (shouldDeleteObject) {
+      try {
+        await deleteObject(media.objectKey);
+      } catch (error) {
+        request.log.warn({ err: error, objectKey: media.objectKey }, "media record deleted but object removal failed; orphan left for GC");
+      }
+    }
     await audit(request, "MEDIA_DELETED", "MEDIA_ASSET", media.id, "SUCCESS");
     return { success: true };
   });

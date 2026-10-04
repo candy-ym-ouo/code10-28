@@ -99,6 +99,17 @@ export async function deleteObject(objectKey: string): Promise<void> {
   await getS3().send(new DeleteObjectCommand({ Bucket: config.S3_BUCKET, Key: objectKey }));
 }
 
+export async function objectExists(objectKey: string): Promise<boolean> {
+  const config = getConfig();
+  try {
+    await getS3().send(new HeadObjectCommand({ Bucket: config.S3_BUCKET, Key: objectKey }));
+    return true;
+  } catch (error) {
+    if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) return false;
+    throw error;
+  }
+}
+
 export async function ensureBucket(): Promise<void> {
   const config = getConfig();
   try {
