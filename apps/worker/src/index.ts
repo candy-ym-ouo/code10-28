@@ -7,7 +7,7 @@ import { Worker } from "bullmq";
 import { Redis } from "ioredis";
 import { getConfig } from "./config/env.js";
 import { prisma } from "./lib/prisma.js";
-import { deleteObject, getObjectStream, putObject } from "./lib/s3.js";
+import { deleteObjectIfExists, getObjectStream, objectExists, putObject } from "./lib/s3.js";
 import { generatePeaks, probeAudio } from "./lib/media.js";
 import { buildUserExport } from "./lib/export.js";
 
@@ -21,12 +21,24 @@ const log = (level: "info" | "error" | "warn", data: Record<string, unknown>, me
 };
 
 async function processMedia(mediaId: string) {
-  const media = await prisma.mediaAsset.findUnique({ where: { id: mediaId } });
-  if (!media) return;
-  await prisma.mediaAsset.update({
+  const media = await prisma.mediaAsset.findUnique({
     where: { id: mediaId },
+    include: { session: { select: { status: true } } },
+  });
+  if (!media) return;
+  if (["CANCELLED"].includes(media.status) || ["DELETING", "DELETE_FAILED"].includes(media.session.status)) return;
+  const claimed = await prisma.mediaAsset.updateMany({
+    where: {
+      id: mediaId,
+      session: { status: { notIn: ["DELETING", "DELETE_FAILED"] } },
+      OR: [
+        { status: { in: ["UPLOADED", "PROCESSING"] } },
+        { status: "FAILED", failureCode: "OBJECT_MISSING" },
+      ],
+    },
     data: { status: "PROCESSING", failureCode: null, failureMessage: null },
   });
+  if (claimed.count === 0) return;
 
   const workDir = await mkdtemp(path.join(tmpdir(), "practice-media-"));
   const extension = path.extname(media.originalName).slice(0, 12);
@@ -36,8 +48,33 @@ async function processMedia(mediaId: string) {
     await pipeline(stream, createWriteStream(localPath));
     const [probe, peaks] = await Promise.all([probeAudio(localPath), generatePeaks(localPath)]);
     await prisma.$transaction(async (tx) => {
-      await tx.mediaAsset.update({
-        where: { id: mediaId },
+      const result = await tx.mediaAsset.updateMany({
+        where: {
+          id: mediaId,
+          status: "PROCESSING",
+          session: { status: { notIn: ["DELETING", "DELETE_FAILED"] } },
+        },
+        data: {
+          status: "READY",
+          durationMs: probe.durationMs,
+          codec: probe.codec,
+          sampleRate: probe.sampleRate,
+          channels: probe.channels,
+          peaks,
+          processedAt: new Date(),
+          expiresAt: null,
+          failureCode: null,
+          failureMessage: null,
+        },
+      });
+      if (result.count === 0) return;
+      await tx.mediaAsset.updateMany({
+        where: {
+          objectKey: media.objectKey,
+          userId: media.userId,
+          status: "FAILED",
+          failureCode: "OBJECT_MISSING",
+        },
         data: {
           status: "READY",
           durationMs: probe.durationMs,
@@ -60,14 +97,29 @@ async function processMedia(mediaId: string) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "UNKNOWN_MEDIA_ERROR";
     const code = message === "NO_AUDIO_STREAM" ? "NO_AUDIO_STREAM" : message === "INVALID_DURATION" ? "INVALID_DURATION" : "MEDIA_PROBE_FAILED";
-    await prisma.mediaAsset.update({
-      where: { id: mediaId },
-      data: {
-        status: "FAILED",
-        failureCode: code,
-        failureMessage: message === "NO_AUDIO_STREAM" ? "文件中没有可用的音轨" : "音频无法解析，请替换文件后重试",
-        processedAt: new Date(),
+    const objectMissing = code === "MEDIA_PROBE_FAILED" && !(await objectExists(media.objectKey).catch(() => true));
+    await prisma.mediaAsset.updateMany({
+      where: {
+        objectKey: media.objectKey,
+        userId: media.userId,
+        OR: [
+          { status: { in: ["READY", "UPLOADED", "PROCESSING"] } },
+          { failureCode: "OBJECT_MISSING" },
+        ],
       },
+      data: objectMissing
+        ? {
+            status: "FAILED",
+            failureCode: "OBJECT_MISSING",
+            failureMessage: "音频对象不存在，请重新上传",
+            processedAt: new Date(),
+          }
+        : {
+            status: "FAILED",
+            failureCode: code,
+            failureMessage: message === "NO_AUDIO_STREAM" ? "文件中没有可用的音轨" : "音频无法解析，请替换文件后重试",
+            processedAt: new Date(),
+          },
     });
     log("error", { mediaId, err: message }, "media probe failed");
   } finally {
@@ -81,16 +133,54 @@ async function cleanupSession(sessionId: string) {
     include: { mediaAssets: { select: { objectKey: true } } },
   });
   if (!session) return;
+  const deletedObjectKeys = new Set<string>();
   try {
     const keys = new Set(session.mediaAssets.map((media) => media.objectKey));
+    await prisma.mediaAsset.updateMany({
+      where: { sessionId, status: { not: "CANCELLED" } },
+      data: { status: "CANCELLED", failureCode: null, failureMessage: null },
+    });
+
     for (const objectKey of keys) {
-      const references = await prisma.mediaAsset.count({ where: { objectKey, sessionId: { not: sessionId } } });
-      if (references === 0) await deleteObject(objectKey);
+      await prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${objectKey}::text))`;
+        const references = await tx.mediaAsset.count({
+          where: { objectKey, status: { not: "CANCELLED" } },
+        });
+        const sessionReferences = await tx.mediaAsset.count({
+          where: { objectKey, sessionId },
+        });
+        if (references <= sessionReferences) {
+          await deleteObjectIfExists(objectKey);
+          deletedObjectKeys.add(objectKey);
+        } else if (!(await objectExists(objectKey))) {
+          await tx.mediaAsset.updateMany({
+            where: { objectKey, status: { not: "CANCELLED" } },
+            data: {
+              status: "FAILED",
+              failureCode: "OBJECT_MISSING",
+              failureMessage: "音频对象不存在，请重新上传",
+            },
+          });
+        }
+      }, { timeout: 20_000 });
     }
     await prisma.practiceSession.delete({ where: { id: sessionId } });
     log("info", { sessionId }, "session cleanup completed");
   } catch (error) {
-    await prisma.practiceSession.updateMany({ where: { id: sessionId }, data: { status: "DELETE_FAILED" } });
+    await prisma.$transaction(async (tx) => {
+      await tx.practiceSession.updateMany({ where: { id: sessionId }, data: { status: "DELETE_FAILED" } });
+      if (deletedObjectKeys.size > 0) {
+        await tx.mediaAsset.updateMany({
+          where: { sessionId, objectKey: { in: [...deletedObjectKeys] } },
+          data: {
+            status: "FAILED",
+            failureCode: "OBJECT_MISSING",
+            failureMessage: "音频对象不存在，请重新上传",
+          },
+        });
+      }
+    });
     throw error;
   }
 }

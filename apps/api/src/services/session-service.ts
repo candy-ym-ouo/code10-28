@@ -185,13 +185,37 @@ export async function requestSessionDeletion(userId: string, sessionId: string, 
   if (confirmationTitle !== session.title) {
     throw new AppError(400, "CONFIRMATION_MISMATCH", "请输入完整练习标题以确认删除");
   }
-  await prisma.practiceSession.update({
-    where: { id: sessionId },
-    data: { status: "DELETING", version: { increment: 1 } },
-  });
+  if (session.status === "DELETING") {
+    throw new AppError(409, "INVALID_SESSION_STATE", "练习正在删除中");
+  }
+  if (session.status === "DELETE_FAILED") {
+    const result = await prisma.practiceSession.updateMany({
+      where: { id: sessionId, userId, status: "DELETE_FAILED" },
+      data: { status: "DELETING", version: { increment: 1 } },
+    });
+    if (result.count !== 1) throw new AppError(409, "VERSION_CONFLICT", "练习状态已变化，请刷新后重试");
+  } else {
+    await prisma.$transaction([
+      prisma.practiceSession.update({
+        where: { id: sessionId },
+        data: { status: "DELETING", version: { increment: 1 } },
+      }),
+      prisma.mediaAsset.updateMany({
+        where: { sessionId, status: { not: "CANCELLED" } },
+        data: { status: "CANCELLED", failureCode: null, failureMessage: null },
+      }),
+    ]);
+  }
   try {
     await enqueueCleanup(sessionId);
   } catch {
+    await prisma.$transaction([
+      prisma.practiceSession.update({ where: { id: sessionId }, data: { status: "DELETE_FAILED" } }),
+      prisma.mediaAsset.updateMany({
+        where: { sessionId },
+        data: { status: "CANCELLED", failureCode: null, failureMessage: null },
+      }),
+    ]);
     throw new AppError(503, "PROCESSING_UNAVAILABLE", "删除任务暂时不可用，请稍后重试");
   }
   return { success: true, sessionId, status: "DELETING" as const };

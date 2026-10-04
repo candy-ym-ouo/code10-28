@@ -70,9 +70,9 @@ Refresh Cookie 路径为 `/api/v1/auth`，生产环境在 HTTPS 下自动使用 
 | POST | `/sessions/:sessionId/media/uploads` | 创建上传会话并返回预签名 PUT URL |
 | POST | `/media/:mediaId/complete-upload` | 校验对象大小/SHA-256 并投递探测任务 |
 | GET | `/media/:mediaId` | 状态、元数据与波形峰值 |
-| GET | `/media/:mediaId/playback-url` | 获取短期私有播放地址 |
+| GET | `/media/:mediaId/playback-url` | 获取短期私有播放地址；对象缺失时返回 410 且记录转为失败 |
 | POST | `/media/:mediaId/retry-probe` | 重试音频探测 |
-| DELETE | `/media/:mediaId` | 删除对象和关联标记 |
+| DELETE | `/media/:mediaId` | 先取消记录，无其他引用时删除对象，最后删除关联标记和记录 |
 
 创建上传会话：
 

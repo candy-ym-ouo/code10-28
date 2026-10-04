@@ -94,9 +94,35 @@ export async function verifyObject(objectKey: string, expectedSize: bigint, expe
   }
 }
 
-export async function deleteObject(objectKey: string): Promise<void> {
+function isNotFoundError(error: unknown): boolean {
+  return (error as { $metadata?: { httpStatusCode?: number }; name?: string }).$metadata?.httpStatusCode === 404
+    || (error as { name?: string }).name === "NotFound";
+}
+
+export async function objectExists(objectKey: string): Promise<boolean> {
   const config = getConfig();
-  await getS3().send(new DeleteObjectCommand({ Bucket: config.S3_BUCKET, Key: objectKey }));
+  try {
+    await getS3().send(new HeadObjectCommand({ Bucket: config.S3_BUCKET, Key: objectKey }));
+    return true;
+  } catch (error) {
+    if (isNotFoundError(error)) return false;
+    throw error;
+  }
+}
+
+export async function deleteObjectIfExists(objectKey: string): Promise<"deleted" | "missing"> {
+  const config = getConfig();
+  try {
+    await getS3().send(new DeleteObjectCommand({ Bucket: config.S3_BUCKET, Key: objectKey }));
+    return "deleted";
+  } catch (error) {
+    if (isNotFoundError(error)) return "missing";
+    throw error;
+  }
+}
+
+export async function deleteObject(objectKey: string): Promise<void> {
+  await deleteObjectIfExists(objectKey);
 }
 
 export async function ensureBucket(): Promise<void> {
